@@ -1,405 +1,366 @@
---[[
-	LAYER 2: DECLARATIVE SCHEMA DSL
-	
-	Provides constructors that describe SHAPES of data:
-	- Schema.struct{ {fieldName = type}, ... }
-	- Schema.list(elementType)
-	- Schema.array(len, elementType)
-	- Schema.map(keyType, valueType)
-	- Schema.union(...)
-	- Schema.konst(value, type, isSerialized)
-	- Schema.save(name, type)
-	- Schema.compat(fn)
-	- Schema.enable_if(cond, type)
-	- Schema.ref(indexTable, type)
-]]
+-- LAYER 2: DECLARATIVE SCHEMA DSL
+-- Describes data shapes for serialization/deserialization
 
 local codec = require(script.Parent.codec)
 
 local Schema = {}
-local SchemaType = {}
-SchemaType.__index = SchemaType
+Schema.__index = Schema
 
--- ============================================================================
--- SCHEMA CONSTRUCTORS
--- ============================================================================
-
-local function make_schema(type_name, props)
-	local s = setmetatable({
-		type = type_name,
-		__props = props or {}
-	}, SchemaType)
-	return s
+-- Helper: Create a schema node
+local function make_schema(ty: string, data: table?): table
+	return setmetatable({
+		type = ty,
+		_data = data or {},
+	}, Schema)
 end
 
-function Schema.struct(fields)
-	--[[ Ordered fields: { {fieldName = type}, ... } ]]
-	local ordered = {}
+-- ============================================================================
+-- STRUCT: Ordered fields
+-- ============================================================================
+function Schema.struct(fields: {[string]: any}): table
+	local field_list = {}
 	for k, v in pairs(fields) do
-		table.insert(ordered, {name = k, schema = v})
+		table.insert(field_list, { name = k, format = v })
 	end
-	return make_schema("struct", {fields = ordered})
+	return make_schema("struct", { fields = field_list })
 end
 
-function Schema.list(elementType)
-	--[[ Length-prefixed sequence (4-byte count prefix) ]]
-	return make_schema("list", {element = elementType})
+-- ============================================================================
+-- LIST: Length-prefixed variable-length sequences
+-- ============================================================================
+function Schema.list(elementType: any): table
+	return make_schema("list", { elementType = elementType })
 end
 
-function Schema.array(len, elementType)
-	--[[ Fixed-length sequence ]]
-	return make_schema("array", {length = len, element = elementType})
+-- ============================================================================
+-- ARRAY: Fixed-length sequences
+-- ============================================================================
+function Schema.array(len: number, elementType: any): table
+	return make_schema("array", { len = len, elementType = elementType })
 end
 
-function Schema.map(keyType, valueType)
-	--[[ Key/value pairs with count prefix ]]
-	return make_schema("map", {key = keyType, value = valueType})
+-- ============================================================================
+-- MAP: Key/value pairs with count prefix
+-- ============================================================================
+function Schema.map(keyType: any, valueType: any): table
+	return make_schema("map", { keyType = keyType, valueType = valueType })
 end
 
-function Schema.union(...)
-	--[[ Sequential composition of formats ]]
-	local members = {...}
-	return make_schema("union", {members = members})
+-- ============================================================================
+-- UNION: Sequential composition (try formats in order)
+-- ============================================================================
+function Schema.union(...: any): table
+	local formats = { ... }
+	return make_schema("union", { formats = formats })
 end
 
-function Schema.konst(value, typeSchema, isSerialized)
-	--[[ Constant field, optionally written to stream ]]
-	isSerialized = isSerialized or false
-	return make_schema("konst", {value = value, schema = typeSchema, serialized = isSerialized})
+-- ============================================================================
+-- KONST: Constant fields, optionally written to stream
+-- ============================================================================
+function Schema.konst(value: any, ty: any, isSerialized: boolean?): table
+	isSerialized = isSerialized ~= false -- default true
+	return make_schema("konst", {
+		value = value,
+		type = ty,
+		isSerialized = isSerialized,
+	})
 end
 
-function Schema.save(name, typeSchema)
-	--[[ Save a value into context table for later reference ]]
-	return make_schema("save", {name = name, schema = typeSchema})
+-- ============================================================================
+-- SAVE: Store a value in context for later reference
+-- ============================================================================
+function Schema.save(name: string, ty: any): table
+	return make_schema("save", { name = name, type = ty })
 end
 
-function Schema.compat(fn)
-	--[[ Version-gated format selection ]]
-	--[[ fn(context) -> schema ]]
-	return make_schema("compat", {selector = fn})
+-- ============================================================================
+-- COMPAT: Version-gated format selection
+-- ============================================================================
+function Schema.GE_VER(version: number, formatIfNewer: any, formatIfOlder: any): table
+	return make_schema("compat", {
+		version = version,
+		formatIfNewer = formatIfNewer,
+		formatIfOlder = formatIfOlder,
+	})
 end
 
-function Schema.enable_if(cond, typeSchema)
-	--[[ Conditionally read/write a field ]]
-	--[[ cond(context) -> bool ]]
-	return make_schema("enable_if", {condition = cond, schema = typeSchema})
+-- ============================================================================
+-- ENABLE_IF: Conditionally read/write a field
+-- ============================================================================
+function Schema.enable_if(cond: boolean | (context: table) -> boolean, ty: any): table
+	local pred = type(cond) == "function" and cond or function() return cond end
+	return make_schema("enable_if", { predicate = pred, type = ty })
 end
 
-function Schema.ref(indexTable, typeSchema)
-	--[[ Indexed back-reference (serialize ID, resolve during load) ]]
-	--[[ indexTable is a table mapping values to IDs ]]
-	return make_schema("ref", {index = indexTable, schema = typeSchema})
+-- ============================================================================
+-- REF: Indexed back-reference
+-- ============================================================================
+function Schema.ref(name: string): table
+	return make_schema("ref", { name = name })
 end
 
--- Primitive schemas
-function Schema.f64()
+-- ============================================================================
+-- PRIMITIVE TYPES: Match against type name strings
+-- ============================================================================
+function Schema.f64(): table
 	return make_schema("f64")
 end
 
-function Schema.i32()
+function Schema.i32(): table
 	return make_schema("i32")
 end
 
-function Schema.i64()
+function Schema.i64(): table
 	return make_schema("i64")
 end
 
-function Schema.string()
+function Schema.string(): table
 	return make_schema("string")
 end
 
-function Schema.bool()
-	return make_schema("bool")
+function Schema.v3(): table
+	return make_schema("v3")
 end
 
-function Schema.vector3()
-	return make_schema("vector3")
-end
-
-function Schema.any()
+function Schema.any(): table
 	return make_schema("any")
 end
 
--- ============================================================================
--- PRIMITIVE TYPE METHODS: :save and :load
--- ============================================================================
-
-local function primitive_save(prim_type, buffer, value)
-	if prim_type == "f64" then
-		local bytes = codec.d2b(value)
-		for _, b in ipairs(bytes) do
-			table.insert(buffer, b)
-		end
-	elseif prim_type == "i32" then
-		local bytes = codec.i2b(value)
-		for _, b in ipairs(bytes) do
-			table.insert(buffer, b)
-		end
-	elseif prim_type == "i64" then
-		local bytes = codec.i642b(value)
-		for _, b in ipairs(bytes) do
-			table.insert(buffer, b)
-		end
-	elseif prim_type == "string" then
-		local bytes = codec.s2b(value)
-		for _, b in ipairs(bytes) do
-			table.insert(buffer, b)
-		end
-	elseif prim_type == "bool" then
-		table.insert(buffer, value and 1 or 0)
-	elseif prim_type == "vector3" then
-		local bytes = codec.v32b(value)
-		for _, b in ipairs(bytes) do
-			table.insert(buffer, b)
-		end
-	elseif prim_type == "any" then
-		local bytes = codec.a2b(value)
-		for _, b in ipairs(bytes) do
-			table.insert(buffer, b)
-		end
-	else
-		error("Unknown primitive type: " .. prim_type)
-	end
-end
-
-local function primitive_load(prim_type, buffer, cursor)
-	if prim_type == "f64" then
-		return codec.b2d(buffer, cursor)
-	elseif prim_type == "i32" then
-		return codec.b2i(buffer, cursor)
-	elseif prim_type == "i64" then
-		return codec.b2i64(buffer, cursor)
-	elseif prim_type == "string" then
-		return codec.b2s(buffer, cursor)
-	elseif prim_type == "bool" then
-		if cursor > #buffer then
-			error("Buffer underflow: not enough bytes for bool")
-		end
-		return buffer[cursor] ~= 0, cursor + 1
-	elseif prim_type == "vector3" then
-		return codec.b2v3(buffer, cursor)
-	elseif prim_type == "any" then
-		return codec.b2a(buffer, cursor)
-	else
-		error("Unknown primitive type: " .. prim_type)
-	end
+function Schema.bool(): table
+	return make_schema("bool")
 end
 
 -- ============================================================================
--- RUNTIME RECURSION: save and load
+-- SAVE: Write data to buffer using a schema
 -- ============================================================================
-
-local function save_schema(buffer, value, schema, context)
-	--[[ Recursively save a value according to schema ]]
+function Schema.save(buffer: table, obj: any, format: any, context: table?): table
 	context = context or {}
 	
-	if schema.type == "f64" or schema.type == "i32" or schema.type == "i64" 
-	   or schema.type == "string" or schema.type == "bool" 
-	   or schema.type == "vector3" or schema.type == "any" then
-		primitive_save(schema.type, buffer, value)
+	if type(format) == "string" then
+		-- Primitive type by name
+		if format == "f64" then
+			table.insert(buffer, codec.d2b(obj))
+		elseif format == "i32" then
+			table.insert(buffer, codec.i2b(obj))
+		elseif format == "i64" then
+			table.insert(buffer, codec.i642b(obj))
+		elseif format == "string" then
+			table.insert(buffer, codec.s2b(obj))
+		elseif format == "v3" then
+			table.insert(buffer, codec.v32b(obj))
+		elseif format == "any" then
+			table.insert(buffer, codec.any2b(obj))
+		elseif format == "bool" then
+			table.insert(buffer, string.char(obj and 1 or 0))
+		else
+			error("Unknown format: " .. format)
+		end
+		return buffer
+	end
 	
-	elseif schema.type == "struct" then
-		for _, field in ipairs(schema.__props.fields) do
-			local fname = field.name
-			local fschema = field.schema
-			save_schema(buffer, value[fname], fschema, context)
-		end
+	if not format or not format.type then
+		error("Invalid format")
+	end
 	
-	elseif schema.type == "list" then
-		-- Length prefix (i32)
-		local bytes = codec.i2b(#value)
-		for _, b in ipairs(bytes) do
-			table.insert(buffer, b)
-		end
-		-- Elements
-		for _, elem in ipairs(value) do
-			save_schema(buffer, elem, schema.__props.element, context)
-		end
+	local ty = format.type
 	
-	elseif schema.type == "array" then
-		-- Fixed-length, no prefix
-		local len = schema.__props.length
-		for i = 1, len do
-			save_schema(buffer, value[i], schema.__props.element, context)
-		end
-	
-	elseif schema.type == "map" then
-		-- Count prefix (i32)
-		local keys = {}
-		for k in pairs(value) do
-			table.insert(keys, k)
-		end
-		local bytes = codec.i2b(#keys)
-		for _, b in ipairs(bytes) do
-			table.insert(buffer, b)
-		end
-		-- Key-value pairs
-		for _, k in ipairs(keys) do
-			save_schema(buffer, k, schema.__props.key, context)
-			save_schema(buffer, value[k], schema.__props.value, context)
+	-- Struct: save each field in order
+	if ty == "struct" then
+		for _, field in ipairs(format._data.fields) do
+			local value = obj[field.name]
+			Schema.save(buffer, value, field.format, context)
 		end
 	
-	elseif schema.type == "union" then
-		-- Save each member in sequence
-		for _, member_schema in ipairs(schema.__props.members) do
-			save_schema(buffer, value, member_schema, context)
+	-- List: save count, then each element
+	elseif ty == "list" then
+		table.insert(buffer, codec.i2b(#obj))
+		for _, elem in ipairs(obj) do
+			Schema.save(buffer, elem, format._data.elementType, context)
 		end
 	
-	elseif schema.type == "konst" then
-		if schema.__props.serialized then
-			save_schema(buffer, schema.__props.value, schema.__props.schema, context)
+	-- Array: save fixed count of elements
+	elseif ty == "array" then
+		for i = 1, format._data.len do
+			Schema.save(buffer, obj[i], format._data.elementType, context)
 		end
 	
-	elseif schema.type == "save" then
-		local name = schema.__props.name
-		save_schema(buffer, value, schema.__props.schema, context)
-		context[name] = value
-	
-	elseif schema.type == "enable_if" then
-		if schema.__props.condition(context) then
-			save_schema(buffer, value, schema.__props.schema, context)
+	-- Map: save count, then key/value pairs
+	elseif ty == "map" then
+		local count = 0
+		for _ in pairs(obj) do count = count + 1 end
+		table.insert(buffer, codec.i2b(count))
+		for k, v in pairs(obj) do
+			Schema.save(buffer, k, format._data.keyType, context)
+			Schema.save(buffer, v, format._data.valueType, context)
 		end
 	
-	elseif schema.type == "compat" then
-		local selected = schema.__props.selector(context)
-		save_schema(buffer, value, selected, context)
+	-- Union: try each format in order (save with first that matches)
+	elseif ty == "union" then
+		-- For now, save with first format; could add type detection
+		Schema.save(buffer, obj, format._data.formats[1], context)
 	
-	elseif schema.type == "ref" then
-		-- Serialize the index ID instead of the value
-		local index = schema.__props.index
-		local id = index[value]
-		if id == nil then
-			error("Value not found in ref index")
+	-- Konst: save value if isSerialized flag is set
+	elseif ty == "konst" then
+		if format._data.isSerialized then
+			Schema.save(buffer, format._data.value, format._data.type, context)
 		end
-		save_schema(buffer, id, schema.__props.schema, context)
+	
+	-- Save: store value in context, then save with type format
+	elseif ty == "save" then
+		Schema.save(buffer, obj, format._data.type, context)
+		context[format._data.name] = obj
+	
+	-- Compat: select format based on context version
+	elseif ty == "compat" then
+		local version = context.version or 0
+		local chosen = version >= format._data.version and format._data.formatIfNewer or format._data.formatIfOlder
+		Schema.save(buffer, obj, chosen, context)
+	
+	-- Enable_if: conditionally save
+	elseif ty == "enable_if" then
+		local pred = format._data.predicate
+		if pred(context) then
+			Schema.save(buffer, obj, format._data.type, context)
+		end
+	
+	-- Ref: save reference ID (index into context table)
+	elseif ty == "ref" then
+		local name = format._data.name
+		local refs = context._refs or {}
+		if not refs[name] then
+			refs[name] = {}
+			context._refs = refs
+		end
+		table.insert(refs[name], obj)
+		table.insert(buffer, codec.i2b(#refs[name] - 1)) -- 0-indexed
 	
 	else
-		error("Unknown schema type: " .. schema.type)
+		error("Unknown format type: " .. ty)
 	end
-end
-
-local function load_schema(buffer, cursor, schema, context)
-	--[[ Recursively load a value according to schema ]]
-	context = context or {}
 	
-	if schema.type == "f64" or schema.type == "i32" or schema.type == "i64" 
-	   or schema.type == "string" or schema.type == "bool" 
-	   or schema.type == "vector3" or schema.type == "any" then
-		return primitive_load(schema.type, buffer, cursor)
-	
-	elseif schema.type == "struct" then
-		local obj = {}
-		for _, field in ipairs(schema.__props.fields) do
-			local fname = field.name
-			local fschema = field.schema
-			obj[fname], cursor = load_schema(buffer, cursor, fschema, context)
-		end
-		return obj, cursor
-	
-	elseif schema.type == "list" then
-		-- Read count
-		local count, new_cursor = codec.b2i(buffer, cursor)
-		cursor = new_cursor
-		local list = {}
-		for i = 1, count do
-			local elem
-			elem, cursor = load_schema(buffer, cursor, schema.__props.element, context)
-			table.insert(list, elem)
-		end
-		return list, cursor
-	
-	elseif schema.type == "array" then
-		-- Fixed-length
-		local len = schema.__props.length
-		local arr = {}
-		for i = 1, len do
-			local elem
-			elem, cursor = load_schema(buffer, cursor, schema.__props.element, context)
-			table.insert(arr, elem)
-		end
-		return arr, cursor
-	
-	elseif schema.type == "map" then
-		-- Read count
-		local count, new_cursor = codec.b2i(buffer, cursor)
-		cursor = new_cursor
-		local map = {}
-		for i = 1, count do
-			local key, val
-			key, cursor = load_schema(buffer, cursor, schema.__props.key, context)
-			val, cursor = load_schema(buffer, cursor, schema.__props.value, context)
-			map[key] = val
-		end
-		return map, cursor
-	
-	elseif schema.type == "union" then
-		-- Load each member in sequence, returning first
-		local result
-		for _, member_schema in ipairs(schema.__props.members) do
-			result, cursor = load_schema(buffer, cursor, member_schema, context)
-		end
-		return result, cursor
-	
-	elseif schema.type == "konst" then
-		if schema.__props.serialized then
-			return load_schema(buffer, cursor, schema.__props.schema, context)
-		else
-			return schema.__props.value, cursor
-		end
-	
-	elseif schema.type == "save" then
-		local name = schema.__props.name
-		local value
-		value, cursor = load_schema(buffer, cursor, schema.__props.schema, context)
-		context[name] = value
-		return value, cursor
-	
-	elseif schema.type == "enable_if" then
-		if schema.__props.condition(context) then
-			return load_schema(buffer, cursor, schema.__props.schema, context)
-		else
-			return nil, cursor
-		end
-	
-	elseif schema.type == "compat" then
-		local selected = schema.__props.selector(context)
-		return load_schema(buffer, cursor, selected, context)
-	
-	elseif schema.type == "ref" then
-		-- Load the index ID and resolve from reverse index
-		local id
-		id, cursor = load_schema(buffer, cursor, schema.__props.schema, context)
-		-- The context should have a reverse index set up by the caller
-		local reverse_index = context._reverse_index
-		if not reverse_index or not reverse_index[id] then
-			error("Ref index not found for ID: " .. tostring(id))
-		end
-		return reverse_index[id], cursor
-	
-	else
-		error("Unknown schema type: " .. schema.type)
-	end
-end
-
--- ============================================================================
--- EXPORTS
--- ============================================================================
-
-Schema.save = save_schema
-Schema.load = load_schema
-
--- Convenience functions for top-level serialization
-function Schema.encode(value, schema, context)
-	--[[ Encode a value to a byte buffer ]]
-	local buffer = {}
-	save_schema(buffer, value, schema, context or {})
 	return buffer
 end
 
-function Schema.decode(buffer, schema, context)
-	--[[ Decode a byte buffer to a value ]]
-	local value, _ = load_schema(buffer, 1, schema, context or {})
-	return value
+-- ============================================================================
+-- LOAD: Read data from buffer using a schema
+-- ============================================================================
+function Schema.load(buffer: string, cursor: number, format: any, context: table?): (any, number)
+	context = context or {}
+	
+	if type(format) == "string" then
+		-- Primitive type by name
+		if format == "f64" then
+			return codec.b2d(buffer, cursor)
+		elseif format == "i32" then
+			return codec.b2i(buffer, cursor)
+		elseif format == "i64" then
+			return codec.b2i64(buffer, cursor)
+		elseif format == "string" then
+			return codec.b2s(buffer, cursor)
+		elseif format == "v3" then
+			return codec.b2v3(buffer, cursor)
+		elseif format == "any" then
+			return codec.b2any(buffer, cursor)
+		elseif format == "bool" then
+			local val = string.byte(buffer, cursor) ~= 0
+			return val, cursor + 1
+		else
+			error("Unknown format: " .. format)
+		end
+	end
+	
+	if not format or not format.type then
+		error("Invalid format")
+	end
+	
+	local ty = format.type
+	local result
+	
+	-- Struct: load each field in order
+	if ty == "struct" then
+		result = {}
+		for _, field in ipairs(format._data.fields) do
+			result[field.name], cursor = Schema.load(buffer, cursor, field.format, context)
+		end
+	
+	-- List: load count, then each element
+	elseif ty == "list" then
+		result = {}
+		local count
+		count, cursor = codec.b2i(buffer, cursor)
+		for _ = 1, count do
+			local elem
+			elem, cursor = Schema.load(buffer, cursor, format._data.elementType, context)
+			table.insert(result, elem)
+		end
+	
+	-- Array: load fixed count of elements
+	elseif ty == "array" then
+		result = {}
+		for _ = 1, format._data.len do
+			local elem
+			elem, cursor = Schema.load(buffer, cursor, format._data.elementType, context)
+			table.insert(result, elem)
+		end
+	
+	-- Map: load count, then key/value pairs
+	elseif ty == "map" then
+		result = {}
+		local count
+		count, cursor = codec.b2i(buffer, cursor)
+		for _ = 1, count do
+			local k, v
+			k, cursor = Schema.load(buffer, cursor, format._data.keyType, context)
+			v, cursor = Schema.load(buffer, cursor, format._data.valueType, context)
+			result[k] = v
+		end
+	
+	-- Union: try each format in order (load with first available)
+	elseif ty == "union" then
+		-- For now, load with first format
+		result, cursor = Schema.load(buffer, cursor, format._data.formats[1], context)
+	
+	-- Konst: return constant value without reading
+	elseif ty == "konst" then
+		result = format._data.value
+		if format._data.isSerialized then
+			-- Skip the bytes that were written
+			_, cursor = Schema.load(buffer, cursor, format._data.type, context)
+		end
+	
+	-- Save: load value, store in context
+	elseif ty == "save" then
+		result, cursor = Schema.load(buffer, cursor, format._data.type, context)
+		context[format._data.name] = result
+	
+	-- Compat: select format based on context version
+	elseif ty == "compat" then
+		local version = context.version or 0
+		local chosen = version >= format._data.version and format._data.formatIfNewer or format._data.formatIfOlder
+		result, cursor = Schema.load(buffer, cursor, chosen, context)
+	
+	-- Enable_if: conditionally load
+	elseif ty == "enable_if" then
+		local pred = format._data.predicate
+		if pred(context) then
+			result, cursor = Schema.load(buffer, cursor, format._data.type, context)
+		else
+			result = nil
+		end
+	
+	-- Ref: load reference ID and resolve from context
+	elseif ty == "ref" then
+		local name = format._data.name
+		local idx
+		idx, cursor = codec.b2i(buffer, cursor)
+		local refs = context._refs and context._refs[name] or {}
+		result = refs[idx + 1] -- 1-indexed in Lua
+	
+	else
+		error("Unknown format type: " .. ty)
+	end
+	
+	return result, cursor
 end
 
 return Schema
